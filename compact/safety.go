@@ -50,24 +50,47 @@ func collectMessageIDs(messages []Message) map[string]bool {
 // 揭示新的配对问题，需要再次修复。
 //
 // 返回调整后的 startIndex.
+//
+// 兼容旧调用：未传入 logger 时使用 NopLogger，行为与原版本一致.
 func adjustIndexToPreserveAPIInvariants(messages []Message, startIndex int) int {
+	return adjustIndexToPreserveAPIInvariantsWithLog(messages, startIndex, NewNopLogger())
+}
+
+// adjustIndexToPreserveAPIInvariantsWithLog 同 adjustIndexToPreserveAPIInvariants，
+// 但在不动点迭代未收敛时记 Warn 日志.
+//
+// 由于每轮迭代只会让 adjusted 单调变小（向左扩展），理论上最多迭代 len(messages) 次。
+// 如果达到上限仍未收敛，说明输入消息存在异常（如 tool_use_id 自引用），
+// 此时记日志方便排查，并返回当前最小索引作为兜底.
+func adjustIndexToPreserveAPIInvariantsWithLog(messages []Message, startIndex int, log Logger) int {
 	if startIndex <= 0 || startIndex >= len(messages) {
 		return startIndex
 	}
+	if log == nil {
+		log = NewNopLogger()
+	}
 
 	adjusted := startIndex
-	// 迭代直到不动点，上限 len(messages) 次防止无限循环
-	for i := 0; i < len(messages); i++ {
+	limit := len(messages)
+	var i int
+	for i = 0; i < limit; i++ {
 		prev := adjusted
 		// 步骤1: 先修复 thinking 块分离（通常产生更小的索引）
 		adjusted = fixThinkingBlockSeparation(messages, adjusted)
 		// 步骤2: 再用新索引修复 tool_use / tool_result 配对
 		adjusted = fixToolUseToolResultPairing(messages, adjusted)
 		if adjusted == prev {
-			break // 不动点，收敛
+			return adjusted
 		}
 	}
 
+	// 达到迭代上限仍未收敛：异常路径，记日志便于排查
+	log.Warn("safety: adjustIndexToPreserveAPIInvariants did not converge within limit",
+		"iterations", i,
+		"limit", limit,
+		"initial_index", startIndex,
+		"final_index", adjusted,
+		"message_count", len(messages))
 	return adjusted
 }
 

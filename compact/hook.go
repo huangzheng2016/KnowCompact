@@ -2,7 +2,6 @@ package compact
 
 import (
 	"context"
-	"log"
 )
 
 // CompactionHook 上下文压缩钩子 —— 以 callback/hook 方式透明集成.
@@ -30,7 +29,17 @@ type CompactionHook struct {
 	MicroCompactOnly bool
 
 	// Silent 静默模式，关闭日志 (默认 false).
+	//
+	// Deprecated: 使用 Logger / LogLevel 进行更细粒度控制。
+	// 当 Logger 为 nil 时，Silent=true 等价于 LogLevel=LogLevelSilent。
 	Silent bool
+
+	// Logger 自定义日志实现。
+	// nil 时使用 Compactor.Config().Logger，再 fallback 到默认 logger。
+	Logger Logger
+
+	// LogLevel 当未提供 Logger 时控制默认 logger 的级别。
+	LogLevel LogLevel
 
 	// OnCompacted 压缩完成回调 (可选).
 	// 可用于记录指标、审计日志.
@@ -44,10 +53,24 @@ func (h *CompactionHook) modelMaxTokens() int {
 	return h.ModelMaxTokens
 }
 
-func (h *CompactionHook) logf(format string, args ...interface{}) {
-	if !h.Silent {
-		log.Printf("[compact-hook] "+format, args...)
+// logger 解析当前 hook 使用的 logger:
+//  1. 显式设置的 h.Logger 最优先
+//  2. Silent=true 时返回 nopLogger（向后兼容）
+//  3. 回退到 hook 自己的 LogLevel 或 compactor config
+func (h *CompactionHook) logger() Logger {
+	if h.Logger != nil {
+		return h.Logger
 	}
+	if h.Silent {
+		return NewNopLogger()
+	}
+	if h.LogLevel != LogLevelUnset {
+		return NewStdLogger(h.LogLevel, nil)
+	}
+	if h.Compactor != nil {
+		return getLogger(h.Compactor.Config())
+	}
+	return NewDefaultLogger()
 }
 
 // ============================================================
@@ -71,6 +94,7 @@ func (h *CompactionHook) PreProcess(ctx context.Context, messages []Message, sta
 	if h.Compactor == nil {
 		return messages, nil
 	}
+	log := h.logger()
 
 	originalTokens := EstimateMessageTokens(messages)
 
@@ -79,8 +103,9 @@ func (h *CompactionHook) PreProcess(ctx context.Context, messages []Message, sta
 		mcResult := MicroCompact(messages, h.Compactor.config.RecentToolsKeep, h.Compactor.config.MicroCompactCaseInsensitive, h.Compactor.config.MicroCompactWhitelist)
 		messages = mcResult.Messages
 		if mcResult.WasCompacted {
-			h.logf("微压缩: 清理 %d 个工具结果, 释放 ~%d tokens",
-				mcResult.ToolsCleared, mcResult.TokensFreed)
+			log.Debug("micro-compact",
+				"tools_cleared", mcResult.ToolsCleared,
+				"tokens_freed", mcResult.TokensFreed)
 		}
 	}
 
@@ -94,18 +119,20 @@ func (h *CompactionHook) PreProcess(ctx context.Context, messages []Message, sta
 		return messages, nil
 	}
 
-	h.logf("触发自动压缩 (tokens=%d > threshold)",
-		originalTokens)
+	log.Info("auto-compact triggered",
+		"tokens_before", originalTokens)
 
 	result, err := h.Compactor.Compact(ctx, messages, h.modelMaxTokens())
 	if err != nil {
-		h.logf("自动压缩失败: %v", err)
+		log.Error("auto-compact failed", "error", err)
 		return messages, nil
 	}
 
 	if result.WasCompacted {
-		h.logf("压缩完成: %d → %d tokens, trigger=%s",
-			result.TokensBefore, result.TokensAfter, result.Trigger)
+		log.Info("compact completed",
+			"tokens_before", result.TokensBefore,
+			"tokens_after", result.TokensAfter,
+			"trigger", result.Trigger)
 
 		if h.OnCompacted != nil {
 			h.OnCompacted(result)
@@ -151,7 +178,22 @@ func (h *CompactionHook) WithCallback(fn func(result *CompactionResult)) *Compac
 }
 
 // WithSilent 设置静默模式.
+//
+// Deprecated: 使用 WithLogger(compact.NewNopLogger()) 或
+// WithLogLevel(compact.LogLevelSilent) 替代。
 func (h *CompactionHook) WithSilent(silent bool) *CompactionHook {
 	h.Silent = silent
+	return h
+}
+
+// WithLogger 设置自定义 Logger.
+func (h *CompactionHook) WithLogger(logger Logger) *CompactionHook {
+	h.Logger = logger
+	return h
+}
+
+// WithLogLevel 设置默认 logger 的级别.
+func (h *CompactionHook) WithLogLevel(level LogLevel) *CompactionHook {
+	h.LogLevel = level
 	return h
 }

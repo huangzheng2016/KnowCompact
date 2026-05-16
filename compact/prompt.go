@@ -203,11 +203,12 @@ func GetCompactUserSummaryMessage(summary string, suppressFollowUp bool, recentP
 ` + formattedSummary
 
 	if recentPreserved {
-		msg += `\n\n最近的消息已逐字保留。`
+		// 注意：原始 raw string `\n\n` 不会被解释为换行；改用解释字符串字面量
+		msg += "\n\n最近的消息已逐字保留。"
 	}
 
 	if suppressFollowUp {
-		msg += `\n\n从断点处继续对话，不要再向用户提问。
+		msg += "\n\n" + `从断点处继续对话，不要再向用户提问。
 直接继续 —— 不要提及摘要内容，
 不要复述之前发生了什么，
 不要用「我将继续」之类的话开头。
@@ -223,9 +224,20 @@ func GetCompactUserSummaryMessage(summary string, suppressFollowUp bool, recentP
 	}
 }
 
+// CompactBoundaryMarker 压缩边界标记常量。
+//
+// 既出现在生成的边界消息中，也用于 isCompactBoundary 反向识别，
+// 二者必须保持一致 —— 早期版本曾经写入中文 "[压缩边界]" 而识别函数只查找
+// "[CompactBoundary]"，导致 session memory 路径无法找到边界。
+const CompactBoundaryMarker = "[CompactBoundary]"
+
 // CreateCompactBoundary 创建压缩边界标记消息.
+//
+// 标记同时包含英文 [CompactBoundary] 与中文 [压缩边界]，以便：
+//  1. 程序检测：依赖固定英文标记，避免本地化文案漂移
+//  2. 人工阅读：中文标签让对话调试时更易识别
 func CreateCompactBoundary(tokensBefore, tokensAfter int, trigger string) Message {
-	text := "[压缩边界]"
+	text := CompactBoundaryMarker + " [压缩边界]"
 	if tokensBefore > 0 {
 		text += "\n压缩前 tokens: " + itoa(tokensBefore)
 	}

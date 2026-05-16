@@ -1,6 +1,7 @@
 package compact
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -191,18 +192,62 @@ func ExtractRecentFilesFromMessages(messages []Message, config CompactionConfig)
 }
 
 // parseFilePathFromToolInput 从文件读取工具的 JSON 参数中解析 file_path.
-// 支持格式：{"file_path":"..."} / {"path":"..."} / {"filepath":"..."}
+//
+// 优先尝试标准 JSON 解析（正确处理转义引号、嵌套对象等）。
+// 解析失败时降级为字符串扫描，以兼容非严格 JSON 的工具输入.
+//
+// 支持字段（按优先级）：file_path / filepath / path / file.
 func parseFilePathFromToolInput(input string) string {
 	input = strings.TrimSpace(input)
+	if input == "" {
+		return ""
+	}
+
+	// 优先路径：标准 JSON 解析
+	if path := parseFilePathJSON(input); path != "" {
+		return path
+	}
+
+	// 降级路径：字符串扫描（兼容非严格 JSON，例如尾随逗号）
+	return parseFilePathFallback(input)
+}
+
+// parseFilePathJSON 用 encoding/json 解析 file_path 字段.
+//
+// 仅当 input 是合法 JSON 对象时才会命中；任何字段缺失或类型不符返回 ""。
+func parseFilePathJSON(input string) string {
+	if !strings.HasPrefix(input, "{") {
+		return ""
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(input), &raw); err != nil {
+		return ""
+	}
+	for _, key := range []string{"file_path", "filepath", "path", "file"} {
+		v, ok := raw[key]
+		if !ok {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// parseFilePathFallback 兼容非严格 JSON 的字符串扫描.
+//
+// 仅在 parseFilePathJSON 失败时使用。仍然存在被转义引号干扰的极端边缘情况，
+// 但相比直接抛错更稳健.
+func parseFilePathFallback(input string) string {
 	for _, key := range []string{`"file_path"`, `"filepath"`, `"path"`, `"file"`} {
 		idx := strings.Index(input, key)
 		if idx < 0 {
 			continue
 		}
-		// 找到 key 后的值
 		after := input[idx+len(key):]
 		after = strings.TrimLeft(after, ` :"`)
-		// 找到结束引号
 		endIdx := strings.Index(after, `"`)
 		if endIdx > 0 {
 			return after[:endIdx]

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"strings"
 )
 
 // FullCompactor 第3层压缩：LLM 摘要生成（传统压缩）.
@@ -102,7 +101,7 @@ func (f *FullCompactor) summarizeWithRetry(ctx context.Context, messages []Messa
 		}
 
 		// 如果是 PTL 错误，尝试裁剪后重试
-		if isPromptTooLongError(err) {
+		if detectPromptTooLong(err, f.config.PromptTooLongDetector) {
 			ptlSummary, ptlErr := f.summarizeWithPTLRetry(ctx, currentMessages)
 			if ptlErr == nil {
 				return ptlSummary, nil
@@ -130,7 +129,7 @@ func (f *FullCompactor) summarizeWithPTLRetry(ctx context.Context, messages []Me
 		}
 
 		// 检查是否为 prompt-too-long 错误
-		if !isPromptTooLongError(err) {
+		if !detectPromptTooLong(err, f.config.PromptTooLongDetector) {
 			return "", err
 		}
 
@@ -215,6 +214,12 @@ func (f *FullCompactor) reactiveTruncate(
 // fallbackTruncateDirect 直接降级截断（不依赖 FullCompactor）.
 //
 // 供 ReactiveCompact 和 fallbackTruncate 复用。
+//
+// 保留策略:
+//  1. 从末尾按比例保留最近消息（受 FallbackTruncateRatio 控制）
+//  2. 调整起始索引以保证 API 不变量（tool 配对、thinking 分离）
+//  3. 从被截断的部分抽取 pinned 消息（PinnedMessageFilter 判定），
+//     按原始顺序插入到摘要消息之后，避免丢失关键指令
 func fallbackTruncateDirect(
 	messages []Message,
 	tokensBefore int,
@@ -240,10 +245,13 @@ func fallbackTruncateDirect(
 	}
 
 	// 调整起始索引以保证 API 不变量
-	startIndex = adjustIndexToPreserveAPIInvariants(messages, startIndex)
+	startIndex = adjustIndexToPreserveAPIInvariantsWithLog(messages, startIndex, getLogger(config))
 
 	// 保留的消息
 	keptMessages := messages[startIndex:]
+
+	// 抽取 pinned 消息（首条 user 指令、显式标记的关键消息）
+	pinnedMessages := collectPinnedMessages(messages, startIndex, config.PinnedMessageFilter)
 
 	// 生成降级提示
 	trigger := "fallback_truncate"
@@ -253,21 +261,34 @@ func fallbackTruncateDirect(
 		hint = "API 返回 prompt-too-long 错误"
 	}
 
-	truncatedCount := startIndex
+	truncatedCount := startIndex - len(pinnedMessages)
+	if truncatedCount < 0 {
+		truncatedCount = 0
+	}
+	noteSuffix := ""
+	if len(pinnedMessages) > 0 {
+		noteSuffix = fmt.Sprintf("（已保留 %d 条 pinned 消息）", len(pinnedMessages))
+	}
 	fallbackMsg := Message{
 		Role: RoleSystem,
 		Content: []ContentBlock{{
 			Type: ContentTypeText,
 			Text: fmt.Sprintf(
-				"[%s] %d 条早期消息因 %s 被丢弃。"+
+				"[%s] %d 条早期消息因 %s 被丢弃%s。"+
 					"仅保留最近 %d 条消息以继续对话。",
-				trigger, truncatedCount, hint, len(keptMessages),
+				trigger, truncatedCount, hint, noteSuffix, len(keptMessages),
 			),
 		}},
 	}
 
 	result := []Message{fallbackMsg}
+	result = append(result, pinnedMessages...)
 	result = append(result, keptMessages...)
+
+	// pinned 消息可能破坏 tool 配对（如 first user 引用了已丢弃的 tool_use），
+	// 但 fallback 截断已经是最后防线，由调用方在 API 调用时由
+	// API 层 normalize 处理；此处不再二次调整。
+
 	tokensAfter := EstimateMessageTokens(result)
 
 	return &CompactionResult{
@@ -362,15 +383,11 @@ func stripMediaBlocks(msg Message) Message {
 }
 
 // isPromptTooLongError 判断是否为 prompt-too-long 错误.
+//
+// Deprecated: 使用 DefaultPromptTooLongDetector 或在 CompactionConfig 中
+// 配置 PromptTooLongDetector 以获得更精确的判定。本函数仅保留向后兼容。
 func isPromptTooLongError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errMsg := err.Error()
-	return strings.Contains(errMsg, "prompt is too long") ||
-		strings.Contains(errMsg, "prompt_too_long") ||
-		strings.Contains(errMsg, "context_length_exceeded") ||
-		strings.Contains(errMsg, "400") && strings.Contains(errMsg, "token")
+	return DefaultPromptTooLongDetector(err)
 }
 
 // PartialCompact 部分压缩：只压缩一部分消息.

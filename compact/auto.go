@@ -2,7 +2,6 @@ package compact
 
 import (
 	"context"
-	"log"
 )
 
 // QuerySource 查询来源类型.
@@ -20,13 +19,15 @@ const (
 //  - shouldAutoCompact 决策树：判断是否应该触发压缩
 //  - autoCompactIfNeeded 执行流程：SM 优先，回退到传统压缩
 //  - 断路器：连续失败 N 次后停止尝试
+//
+// 断路器状态完全由内部 circuitBreaker 持有，不在外层再维护重复计数器，
+// 避免多 goroutine 下的状态不一致。
 type AutoCompactor struct {
-	microCompactor    *MicroCompactResult // 最近微压缩结果
-	fullCompactor     *FullCompactor
-	sessionCompactor  *SessionMemoryCompactor
-	config            CompactionConfig
-	circuitBreaker    *compactCircuitBreaker
-	consecutiveFailures int
+	microCompactor   *MicroCompactResult // 最近微压缩结果
+	fullCompactor    *FullCompactor
+	sessionCompactor *SessionMemoryCompactor
+	config           CompactionConfig
+	circuitBreaker   *compactCircuitBreaker
 }
 
 // NewAutoCompactor 创建自动压缩器.
@@ -143,7 +144,17 @@ func (a *AutoCompactor) AutoCompactIfNeeded(
 	if a.fullCompactor != nil {
 		result, err := a.fullCompactor.Compact(ctx, messages, BaseCompactPrompt, "from")
 		if err == nil && result != nil && result.WasCompacted {
-			a.circuitBreaker.recordSuccess()
+			// fallback / reactive truncate 是"降级路径" —— 虽然返回了结果，但 LLM 摘要本身失败了，
+			// 应该计入断路器，避免反复触发昂贵的 LLM 调用后总是降级。
+			if result.Trigger == "fallback_truncate" || result.Trigger == "reactive_truncate" {
+				failures, justTripped := a.circuitBreaker.recordFailure()
+				if justTripped {
+					getLogger(a.config).Warn("circuit breaker triggered after consecutive fallback truncations",
+						"consecutive_failures", failures)
+				}
+			} else {
+				a.circuitBreaker.recordSuccess()
+			}
 			if a.config.OnCompactionEnd != nil {
 				a.config.OnCompactionEnd(*result)
 			}
@@ -151,13 +162,11 @@ func (a *AutoCompactor) AutoCompactIfNeeded(
 		}
 	}
 
-	// 记录失败
-	a.circuitBreaker.recordFailure()
-	a.consecutiveFailures++
-
-	if a.consecutiveFailures >= a.config.MaxConsecutiveFailures {
-		log.Printf("[compact] circuit breaker triggered after %d consecutive failures, "+
-			"auto-compact disabled for this session", a.consecutiveFailures)
+	// 记录失败（断路器是唯一真相源）
+	failures, justTripped := a.circuitBreaker.recordFailure()
+	if justTripped {
+		getLogger(a.config).Warn("circuit breaker triggered, auto-compact disabled for this session",
+			"consecutive_failures", failures)
 	}
 
 	return &CompactionResult{WasCompacted: false}, nil
@@ -179,5 +188,14 @@ func (a *AutoCompactor) IsNearLimit(messages []Message, modelMaxTokens int) bool
 // Reset 重置自动压缩器状态.
 func (a *AutoCompactor) Reset() {
 	a.circuitBreaker.reset()
-	a.consecutiveFailures = 0
+}
+
+// ConsecutiveFailures 返回当前连续失败次数（用于可观测性与测试）.
+func (a *AutoCompactor) ConsecutiveFailures() int {
+	return a.circuitBreaker.failureCount()
+}
+
+// IsCircuitOpen 返回断路器是否已打开（外部只读访问）.
+func (a *AutoCompactor) IsCircuitOpen() bool {
+	return a.circuitBreaker.isOpen()
 }

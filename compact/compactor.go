@@ -2,6 +2,7 @@ package compact
 
 import (
 	"context"
+	"fmt"
 )
 
 // DefaultCompactor 默认压缩器——编排 4 层压缩体系.
@@ -49,13 +50,26 @@ func NewDefaultCompactor(
 // Compact 对消息列表执行完整的压缩管线.
 //
 // 管线:
-//  1. MicroCompact: 清理旧的工具输出
-//  2. AutoCompact: 如果超过阈值，触发 SM 或 Full Compact
+//  1. PreCompact 钩子（用户可改写消息列表）
+//  2. MicroCompact: 清理旧的工具输出
+//  3. AutoCompact: 如果超过阈值，触发 SM 或 Full Compact
+//  4. PostCompact 钩子（用户可改写压缩结果）
 func (c *DefaultCompactor) Compact(
 	ctx context.Context,
 	messages []Message,
 	modelMaxTokens int,
 ) (*CompactionResult, error) {
+	// PreCompact 钩子
+	if c.config.PreCompact != nil {
+		rewritten, err := c.config.PreCompact(ctx, messages)
+		if err != nil {
+			return nil, fmt.Errorf("compact: pre-compact hook failed: %w", err)
+		}
+		if rewritten != nil {
+			messages = rewritten
+		}
+	}
+
 	// Layer 1: MicroCompact
 	microCompacted := false
 	microTokensFreed := 0
@@ -79,20 +93,20 @@ func (c *DefaultCompactor) Compact(
 			result.TokensBefore += microTokensFreed
 			result.Trigger = "micro+" + result.Trigger
 		}
-		return result, nil
+		return c.applyPostCompact(ctx, result)
 	}
 
 	// 不需要 AutoCompact，返回当前状态
 	tokens := EstimateMessageTokens(messages)
 	if microCompacted {
 		// MicroCompact 修改了消息但 AutoCompact 未触发
-		return &CompactionResult{
+		return c.applyPostCompact(ctx, &CompactionResult{
 			WasCompacted: true,
 			Trigger:      "micro_compact",
 			Messages:     messages,
 			TokensBefore: tokens + microTokensFreed,
 			TokensAfter:  tokens,
-		}, nil
+		})
 	}
 
 	return &CompactionResult{
@@ -101,6 +115,27 @@ func (c *DefaultCompactor) Compact(
 		TokensBefore: tokens,
 		TokensAfter:  tokens,
 	}, nil
+}
+
+// applyPostCompact 在压缩结果上应用 PostCompact 钩子.
+//
+// 钩子返回的结果替代原结果；钩子返回 error 时整次压缩视为失败，
+// 调用方应将其视为 Compact 失败并触发对应错误处理。
+func (c *DefaultCompactor) applyPostCompact(
+	ctx context.Context,
+	result *CompactionResult,
+) (*CompactionResult, error) {
+	if c.config.PostCompact == nil || result == nil {
+		return result, nil
+	}
+	rewritten, err := c.config.PostCompact(ctx, result)
+	if err != nil {
+		return nil, fmt.Errorf("compact: post-compact hook failed: %w", err)
+	}
+	if rewritten == nil {
+		return result, nil
+	}
+	return rewritten, nil
 }
 
 // ShouldCompact 判断是否应该触发压缩.
@@ -156,7 +191,7 @@ func (c *DefaultCompactor) ManualCompact(
 		c.config.OnCompactionEnd(*result)
 	}
 
-	return result, nil
+	return c.applyPostCompact(ctx, result)
 }
 
 // GetAutoCompactor 获取内部 AutoCompactor（用于高级定制）.

@@ -54,6 +54,40 @@ type CompactionConfig struct {
 	// 回调
 	OnCompactionStart func(info CompactionInfo)     `json:"-"`
 	OnCompactionEnd   func(result CompactionResult) `json:"-"`
+
+	// PreCompact 在压缩开始前回调，允许用户改写消息列表。
+	// 典型用途：敏感信息脱敏、特定消息打标、Pinned 标记的注入。
+	// 返回的消息列表会替代原列表参与后续压缩。返回 error 时压缩中止。
+	// nil 表示不处理。
+	PreCompact func(ctx context.Context, messages []Message) ([]Message, error) `json:"-"`
+
+	// PostCompact 在压缩完成后回调，允许用户改写压缩结果。
+	// 典型用途：附加自定义元数据、二次过滤、上报。
+	// 返回的结果会替代原结果。返回 error 时整次压缩视为失败。
+	// nil 表示不处理。
+	PostCompact func(ctx context.Context, result *CompactionResult) (*CompactionResult, error) `json:"-"`
+
+	// PromptTooLongDetector 用户自定义的 PTL 错误判定函数。
+	// nil 时使用 DefaultPromptTooLongDetector。
+	// 详见 errors.go。
+	PromptTooLongDetector PromptTooLongDetector `json:"-"`
+
+	// Logger 用户传入的日志实现。
+	// nil 时使用基于 stdlib log 的默认实现（NewStdLogger）。
+	// 适配 slog/zap/logrus 时，实现 Logger 接口即可。
+	Logger Logger `json:"-"`
+
+	// LogLevel 日志级别。
+	// 零值（LogLevelUnset）等同于 LogLevelInfo。
+	// 仅在 Logger 为 nil 时生效（用户传入的 Logger 自己管理 level）。
+	LogLevel LogLevel `json:"-"`
+
+	// PinnedMessageFilter 判断一条消息是否"必须保留"。
+	// 在降级截断（fallbackTruncate）等会丢弃消息的路径中，
+	// 标记为 pinned 的消息会被强制保留在结果中。
+	// 默认实现：保留首条 user 消息 + 任何 Extra["pinned"]=="true" 的消息。
+	// nil 时使用 DefaultPinnedMessageFilter。
+	PinnedMessageFilter PinnedMessageFilter `json:"-"`
 }
 
 // DefaultCompactionConfig 返回默认配置.
@@ -192,6 +226,55 @@ func (c CompactionConfig) WithSMMaxTokens(n int) CompactionConfig {
 	return c
 }
 
+// WithLogger 设置自定义 Logger。
+//
+// 用户可适配 slog/zap/logrus —— 实现 Logger 接口即可。
+// nil 时回退到内置默认 logger（受 LogLevel 控制）。
+func (c CompactionConfig) WithLogger(logger Logger) CompactionConfig {
+	c.Logger = logger
+	return c
+}
+
+// WithLogLevel 设置默认 logger 的日志级别（仅当未提供自定义 Logger 时生效）.
+func (c CompactionConfig) WithLogLevel(level LogLevel) CompactionConfig {
+	c.LogLevel = level
+	return c
+}
+
+// WithPromptTooLongDetector 设置用户自定义的 PTL 错误判定函数.
+func (c CompactionConfig) WithPromptTooLongDetector(d PromptTooLongDetector) CompactionConfig {
+	c.PromptTooLongDetector = d
+	return c
+}
+
+// WithPreCompact 注册压缩前回调。
+//
+// 钩子返回的消息列表会替代原列表参与后续压缩。
+// 返回 error 时整次压缩中止（不会触发 PostCompact）。
+func (c CompactionConfig) WithPreCompact(
+	fn func(ctx context.Context, messages []Message) ([]Message, error),
+) CompactionConfig {
+	c.PreCompact = fn
+	return c
+}
+
+// WithPostCompact 注册压缩后回调。
+//
+// 钩子返回的结果会替代原结果。
+// 返回 error 时本次压缩视为失败（会影响断路器计数）。
+func (c CompactionConfig) WithPostCompact(
+	fn func(ctx context.Context, result *CompactionResult) (*CompactionResult, error),
+) CompactionConfig {
+	c.PostCompact = fn
+	return c
+}
+
+// WithPinnedMessageFilter 设置 pinned 消息判定函数（用于降级截断保留关键消息）.
+func (c CompactionConfig) WithPinnedMessageFilter(f PinnedMessageFilter) CompactionConfig {
+	c.PinnedMessageFilter = f
+	return c
+}
+
 // Compactor 上下文压缩器接口.
 type Compactor interface {
 	Compact(ctx context.Context, messages []Message, modelMaxTokens int) (*CompactionResult, error)
@@ -243,11 +326,23 @@ func (b *compactCircuitBreaker) recordSuccess() {
 	b.disabled = false
 }
 
-func (b *compactCircuitBreaker) recordFailure() {
+// recordFailure 记录一次失败，返回累计连续失败次数以及是否刚好触发断路器。
+//
+// 返回值用于外部决策（如日志输出），避免调用方再维护重复的失败计数。
+func (b *compactCircuitBreaker) recordFailure() (failures int, justTripped bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	prev := b.consecutiveFailures
 	b.consecutiveFailures++
 	b.lastFailureTime = time.Now()
+	return b.consecutiveFailures, prev < b.maxFailures && b.consecutiveFailures >= b.maxFailures
+}
+
+// failureCount 返回当前连续失败次数（仅用于测试与可观测性）.
+func (b *compactCircuitBreaker) failureCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.consecutiveFailures
 }
 
 func (b *compactCircuitBreaker) reset() {

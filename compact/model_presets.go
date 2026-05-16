@@ -140,6 +140,8 @@ func PresetQwenMax() ModelPreset {
 
 // PresetForModel 根据模型名自动选择预设.
 // 匹配规则：模型名转小写后按关键词匹配.
+// 未匹配到任何已知模型时返回 UnknownPreset，调用方应通过 IsUnknownPreset
+// 检测并提示用户显式传入 WithModelMaxTokens()。
 func PresetForModel(modelName string) ModelPreset {
 	lower := strings.ToLower(modelName)
 
@@ -169,11 +171,27 @@ func PresetForModel(modelName string) ModelPreset {
 		return PresetQwenMax()
 
 	default:
-		return ModelPreset{
-			Name: "Unknown (128K)", ContextWindow: 128_000,
-			MaxOutputTokens: 8_192, ReservedForSummary: 8_000, BufferTokens: 10_000,
-		}
+		return UnknownPreset()
 	}
+}
+
+// UnknownPreset 表示未知模型的兜底预设。
+// Name 以 "Unknown" 开头，便于 IsUnknownPreset 识别。
+//
+// 注意：兜底窗口仍设为 128K 以便程序能继续运行，但调用方必须意识到
+// 这只是一个保守猜测。理想情况下，用户应通过 WithModelMaxTokens()
+// 显式覆盖，否则真实窗口超出此值时阈值不会触发，
+// 真实窗口小于此值时则会被 API 直接拒绝。
+func UnknownPreset() ModelPreset {
+	return ModelPreset{
+		Name: "Unknown (128K fallback)", ContextWindow: 128_000,
+		MaxOutputTokens: 8_192, ReservedForSummary: 8_000, BufferTokens: 10_000,
+	}
+}
+
+// IsUnknownPreset 判断给定预设是否为未识别模型的兜底值.
+func IsUnknownPreset(p ModelPreset) bool {
+	return strings.HasPrefix(p.Name, "Unknown")
 }
 
 // ============================================================

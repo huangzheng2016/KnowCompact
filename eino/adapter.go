@@ -179,9 +179,21 @@ func NewSummarizerFromEinoModel(m model.BaseChatModel, modelName string) compact
 //
 // 如果需要 Session Memory（Layer 4），手动传入 memStore：
 //
-//	store := &compact.InMemorySessionStore{}
+//	store := compact.NewInMemorySessionMemoryStore()
+//	summarizer := eino.NewSummarizerFromEinoModel(chatModel, "kimi-k2.6")
 //	compactor := compact.NewDefaultCompactor(config, summarizer, store)
+//
+// 当 modelName 无法匹配任何内置预设时，会通过 logger 输出一次性警告，
+// 提示调用方使用 NewCompactMiddleware(..., modelMaxTokens) 显式指定窗口大小，
+// 否则真实窗口大小可能与默认 128K 不一致，导致阈值偏差。
 func NewDefaultCompactorWithEinoModel(config compact.CompactionConfig, chatModel model.BaseChatModel, modelName string) *compact.DefaultCompactor {
+	preset := compact.PresetForModel(modelName)
+	if compact.IsUnknownPreset(preset) {
+		log := compact.GetLogger(config)
+		log.Warn("unknown model preset, falling back to 128K window — pass an explicit modelMaxTokens to NewCompactMiddleware",
+			"model", modelName,
+			"fallback_window", preset.ContextWindow)
+	}
 	summarizer := NewSummarizerFromEinoModel(chatModel, modelName)
 	return compact.NewDefaultCompactor(config, summarizer, nil)
 }
@@ -196,20 +208,64 @@ type CompactMiddleware struct {
 	*adk.BaseChatModelAgentMiddleware
 	compactor      *compact.DefaultCompactor
 	modelMaxTokens int
+	logger         compact.Logger
 }
 
 // NewCompactMiddleware 创建 KnowCompact 上下文压缩中间件.
 //
-// modelMaxTokens: 模型上下文窗口大小（默认 200_000）
+// modelMaxTokens: 模型上下文窗口大小（默认 256_000）
+//
+// 日志通过 compactor.Config().Logger 解析；如需自定义，请在 CompactionConfig
+// 中通过 WithLogger / WithLogLevel 配置。
 func NewCompactMiddleware(compactor *compact.DefaultCompactor, modelMaxTokens int) *CompactMiddleware {
 	if modelMaxTokens <= 0 {
 		modelMaxTokens = 256_000
+	}
+	var log compact.Logger
+	if compactor != nil {
+		log = compact.GetLogger(compactor.Config())
+	} else {
+		log = compact.NewDefaultLogger()
 	}
 	return &CompactMiddleware{
 		BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{},
 		compactor:                    compactor,
 		modelMaxTokens:               modelMaxTokens,
+		logger:                       log,
 	}
+}
+
+// NewEinoMiddleware 是 NewCompactMiddleware 的一行包装，便于快速接入.
+//
+// 这是 KnowCompact 与 eino 集成的"最短路径"：
+//
+//	mw := eino.NewEinoMiddleware(chatModel, "claude-opus-4-7")
+//	agent.Use(mw)
+//
+// 行为:
+//  1. 通过 modelName 自动选择 ModelPreset（窗口大小、阈值）
+//  2. 自动用同一个 chatModel 作为压缩摘要器（节省一次模型创建）
+//  3. 内置 Layer 1/2/3 压缩；如需 Layer 4 Session Memory，
+//     请改用 NewDefaultCompactorWithEinoModel + 显式传入 store.
+//
+// 如果想覆盖配置（缓冲大小、回调、自定义 logger 等），用
+// NewEinoMiddlewareWithConfig 替代.
+func NewEinoMiddleware(chatModel model.BaseChatModel, modelName string) *CompactMiddleware {
+	return NewEinoMiddlewareWithConfig(compact.DefaultCompactionConfig(), chatModel, modelName)
+}
+
+// NewEinoMiddlewareWithConfig 接受显式 CompactionConfig 的一行 API.
+//
+// 模型窗口大小取 ModelPreset.ContextWindow；当 modelName 未命中预设时，
+// NewDefaultCompactorWithEinoModel 会输出 Warn 日志.
+func NewEinoMiddlewareWithConfig(
+	config compact.CompactionConfig,
+	chatModel model.BaseChatModel,
+	modelName string,
+) *CompactMiddleware {
+	preset := compact.PresetForModel(modelName)
+	compactor := NewDefaultCompactorWithEinoModel(config, chatModel, modelName)
+	return NewCompactMiddleware(compactor, preset.ContextWindow)
 }
 
 // BeforeModelRewriteState 在每次模型调用前执行上下文压缩.
@@ -225,27 +281,35 @@ func (m *CompactMiddleware) BeforeModelRewriteState(
 	compactMsgs := FromSchemaMessages(state.Messages)
 	result, err := m.compactor.Compact(ctx, compactMsgs, m.modelMaxTokens)
 	if err != nil {
-		fmt.Printf("  [KnowCompact] 压缩失败: %v\n", err)
+		m.logger.Error("compact failed", "error", err)
 		return ctx, state, nil
 	}
 
 	// 响应式检查：压缩后仍然超过危险阈值？前置降级
 	dangerThreshold := int(float64(m.modelMaxTokens) * 0.95)
 	if result.TokensAfter > dangerThreshold {
-		fmt.Printf("  [KnowCompact] 压缩后仍超过危险阈值 (%d > %d)，触发响应式截断\n",
-			result.TokensAfter, dangerThreshold)
+		m.logger.Warn("post-compact still over danger threshold, triggering reactive truncate",
+			"tokens_after", result.TokensAfter,
+			"danger_threshold", dangerThreshold)
 		reactiveResult, rerr := m.compactor.ReactiveCompact(ctx, result.Messages, m.modelMaxTokens)
 		if rerr == nil && reactiveResult != nil {
 			result = reactiveResult
-			fmt.Printf("  [KnowCompact] 响应式截断: %d → %d tokens (trigger=%s)\n",
-				result.TokensBefore, result.TokensAfter, result.Trigger)
+			m.logger.Info("reactive truncate done",
+				"tokens_before", result.TokensBefore,
+				"tokens_after", result.TokensAfter,
+				"trigger", result.Trigger)
+		} else if rerr != nil {
+			m.logger.Error("reactive truncate failed", "error", rerr)
 		}
 	}
 
 	if result.WasCompacted {
-		fmt.Printf("  [KnowCompact] %d → %d tokens (trigger=%s, messages=%d→%d)\n",
-			result.TokensBefore, result.TokensAfter, result.Trigger,
-			len(state.Messages), len(result.Messages))
+		m.logger.Info("compact applied",
+			"tokens_before", result.TokensBefore,
+			"tokens_after", result.TokensAfter,
+			"trigger", result.Trigger,
+			"messages_before", len(state.Messages),
+			"messages_after", len(result.Messages))
 	}
 
 	state.Messages = ToSchemaMessages(result.Messages)

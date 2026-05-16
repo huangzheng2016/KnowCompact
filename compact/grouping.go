@@ -64,15 +64,23 @@ func findCompactBoundary(messages []Message, fromIndex int) int {
 }
 
 // isCompactBoundary 判断是否为压缩边界标记消息.
+//
+// 匹配规则:
+//   - CompactBoundaryMarker（当前实现写入的固定英文标记）
+//   - "compaction boundary"（兼容 Claude Code 原始格式）
+//   - "[压缩边界]"（兼容历史中文标记，迁移过渡用）
 func isCompactBoundary(msg Message) bool {
 	if msg.Role != RoleSystem {
 		return false
 	}
 	for _, b := range msg.Content {
-		if b.Type == ContentTypeText && len(b.Text) > 0 {
-			if strings.Contains(b.Text, "[CompactBoundary]") || strings.Contains(b.Text, "compaction boundary") {
-				return true
-			}
+		if b.Type != ContentTypeText || len(b.Text) == 0 {
+			continue
+		}
+		if strings.Contains(b.Text, CompactBoundaryMarker) ||
+			strings.Contains(b.Text, "compaction boundary") ||
+			strings.Contains(b.Text, "[压缩边界]") {
+			return true
 		}
 	}
 	return false

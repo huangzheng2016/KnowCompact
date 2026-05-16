@@ -40,3 +40,4 @@ Thumbs.db
 
 # Go binaries (go build in package dir produces name-matching executable)
 /examples/eino_demo/eino_demo
+/examples/failure_scenarios/failure_scenarios
